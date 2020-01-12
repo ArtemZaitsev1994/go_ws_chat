@@ -97,6 +97,7 @@ type (
 		FromUser    string `json:"from"`
 		CompanyName string `json:"company"`
 		SubType     string `json:"subtype"`
+		ToUser      string `json:"to_user"`
 	}
 
 	NotifInnerStruct struct {
@@ -151,6 +152,7 @@ const (
 	NEW_USER_IN_COMPANY = "new_user_in_company"
 	NEW_EVENT           = "new_event"
 	NEW_MESS            = "new_mess"
+	CHAT_MESS           = "chat_mess"
 	JOINED              = "joined"
 	CLOSED              = "closed"
 
@@ -209,6 +211,8 @@ func routeEvents() {
 	// словарь с сокетами пользователей
 	sockets := make(map[string]map[uuid.UUID]Ch)
 
+	note_c := db.Collection("notifications")
+
 	for {
 		select {
 
@@ -249,12 +253,19 @@ func routeEvents() {
 			}
 
 		case note := <-notifications:
+
+			n := note.note
+
 			switch t := note.note.SubType; t {
 			case JOINED:
 				fmt.Println("JOINED")
 		    case NEW_MESS:
 				if note.ForCompany != "" {
 					for _, user := range note.Users {
+						n.ToUser = user
+						// сохраняем в базе оповещение
+						_, err := note_c.InsertOne(context.TODO(), n)
+						FailOnError(err, "Insertion notification failed")
 						for _, ch := range sockets[user] {
 							ch.noteChan <- note.note
 						}
@@ -262,12 +273,20 @@ func routeEvents() {
 				}
 			case NEW_EVENT:
 				for _, user := range note.Users {
+					n.ToUser = user
+					// сохраняем в базе оповещение
+					_, err := note_c.InsertOne(context.TODO(), n)
+					FailOnError(err, "Insertion notification failed")
 					for _, ch := range sockets[user] {
 						ch.noteChan <- note.note
 					}
 				}
 			case NEW_USER_IN_COMPANY:
 				for _, user := range note.Users {
+					n.ToUser = user
+					// сохраняем в базе оповещение
+					_, err := note_c.InsertOne(context.TODO(), n)
+					FailOnError(err, "Insertion notification failed")
 					for _, ch := range sockets[user] {
 						ch.noteChan <- note.note
 					}
@@ -322,6 +341,7 @@ func WsChat(ws *websocket.Conn) {
 	mess_c := db.Collection("messages")
 	comp_c := db.Collection("company")
 	unr_c  := db.Collection("unread_message")
+	note_c := db.Collection("notifications")
 
 	// получение сообщений из сокета
 	L:
@@ -330,7 +350,7 @@ func WsChat(ws *websocket.Conn) {
 			websocket.JSON.Receive(ws, &messData)
 
 			switch mtype := messData.MType; mtype {
-			case NEW_MESS:
+			case CHAT_MESS:
 				companyId := clientData.CompanyId
 
 				m := Message{
@@ -356,10 +376,26 @@ func WsChat(ws *websocket.Conn) {
 					).Decode(&company)
 				FailOnError(err, "Searching company in mongo failed")
 
+				n := Notification{
+					Text:        messData.MText,
+					Type:        NOTIFICATION,
+					SubType:     NEW_MESS,
+					UserID:      messData.Sender,
+					// UserLogin:   messData.SenderLogin,
+					CompanyName: messData.CompanyName,
+					FromUser:    messData.SenderLogin,
+				}
+
 				for _, user := range company.Users {
 					if clientData.SelfId != user {
+
+						n.ToUser = user
+						// сохраняем в базе оповещение
+						_, err := note_c.InsertOne(context.TODO(), n)
+						FailOnError(err, "Insertion notification failed")
+
 						var u UnreadMessage
-						err = comp_c.FindOne(
+						err = unr_c.FindOne(
 							context.TODO(),
 							bson.D{
 								{"to_company", companyId},
@@ -394,15 +430,6 @@ func WsChat(ws *websocket.Conn) {
 				}
 
 				// Отправка сообщений и оповещений в каналы
-				n := Notification{
-					Text:        messData.MText,
-					Type:        NOTIFICATION,
-					SubType:     NEW_MESS,
-					UserID:      messData.Sender,
-					// UserLogin:   messData.SenderLogin,
-					CompanyName: messData.CompanyName,
-					FromUser:    messData.SenderLogin,
-				}
 				msg := MessToCompany{
 					FromUser:      clientData.SelfId,
 			        Msg:           messData.MText,
