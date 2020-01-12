@@ -476,7 +476,8 @@ func WsCommon(ws *websocket.Conn) {
 func main() {
 	// -----------REDIS--------------
 	redis_cl := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		// Addr:     "localhost:6379",
+		Addr:     "redis:6379",
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -491,7 +492,7 @@ func main() {
 
 	// -----------MONGO----------------
 	// Create client
-	mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
+	mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb:mongodb:27017"))
 	FailOnError(err, "Client creation failed")
 
 	// options := options.Find()
