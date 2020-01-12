@@ -492,7 +492,8 @@ func main() {
 
 	// -----------MONGO----------------
 	// Create client
-	mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb:mongodb:27017"))
+	// mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
+	mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://mongodb:27017"))
 	FailOnError(err, "Client creation failed")
 
 	// options := options.Find()
