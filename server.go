@@ -1,7 +1,7 @@
 package main
 
 import (
-	// "os"
+	"os"
 	"context"
 	"fmt"
 	"strconv"
@@ -146,6 +146,9 @@ var (
 
 	db       *mongo.Database
 	redis_cl *redis.Client
+
+	REDIS_HOST = "redis:6379"
+	MONGO_HOST = "mongodb://mongodb:27017"
 )
 
 const (
@@ -501,10 +504,19 @@ func WsCommon(ws *websocket.Conn) {
 }
 
 func main() {
+	// Чтение аргументов
+	args := os.Args
+	if len(args) > 1 {
+		local := args[1]
+		if local == "local" {
+			REDIS_HOST = "localhost:6379"
+			MONGO_HOST = "mongodb://127.0.0.1:27017"
+		}
+	}
+
 	// -----------REDIS--------------
 	redis_cl := redis.NewClient(&redis.Options{
-		// Addr:     "localhost:6379",
-		Addr:     "redis:6379",
+		Addr:     REDIS_HOST,
 		Password: "", // no password set
 		DB:       0,  // use default DB
 	})
@@ -519,8 +531,7 @@ func main() {
 
 	// -----------MONGO----------------
 	// Create client
-	// mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
-	mon_client, err := mongo.NewClient(options.Client().ApplyURI("mongodb://mongodb:27017"))
+	mon_client, err := mongo.NewClient(options.Client().ApplyURI(MONGO_HOST))
 	FailOnError(err, "Client creation failed")
 
 	// options := options.Find()
