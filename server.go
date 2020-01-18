@@ -15,7 +15,7 @@ import (
 	"github.com/go-redis/redis"
 	"github.com/google/uuid"
     // "strconv"
-    // "strings"
+    "strings"
     // "encoding/hex"
     "encoding/json"
 
@@ -71,10 +71,21 @@ type (
 
 	// Структура для записи сообщения в Mongo
 	Message struct {
-        FromUser   string    `bson:"from_user"`
-        Msg        string    `bson:"msg"`
-        InsertTime time.Time `bson:"time"`
-        CompanyId  string    `bson:"company_id"`
+        FromUser   string             `bson:"from_user"`
+        Msg        string             `bson:"msg"`
+        InsertTime time.Time          `bson:"time"`
+        CompanyId  string             `bson:"company_id"`
+        UserName   string             `bson:"user_name"`
+	}
+
+	// Для чтения из монго
+	MessWithId struct {
+        FromUser   string             `bson:"from_user"`
+        Msg        string             `bson:"msg"`
+        InsertTime time.Time          `bson:"time"`
+        CompanyId  string             `bson:"company_id"`
+        UserName   string             `bson:"user_name"`
+		MessageId  primitive.ObjectID `bson:"_id"`
 	}
 
 	// Структура сообщения внутри комнаты отправляемого в клиента
@@ -152,18 +163,50 @@ var (
 )
 
 const (
+	// Типы сообщений
 	NEW_USER_IN_COMPANY = "new_user_in_company"
 	NEW_EVENT           = "new_event"
 	NEW_MESS            = "new_mess"
 	CHAT_MESS           = "chat_mess"
 	JOINED              = "joined"
 	CLOSED              = "closed"
+	PART                = "part"
 
+	// Еще какие-то типы... не помню
 	NOTIFICATION         = "notification"
 	COMPANY_CHANNEL_NAME = "company"
 	EVENT_CHANNEL_NAME   = "events"
+
+	PER_REQ = 20
 )
 
+
+func getMessPart(companyId string, msgId string, mess_c *mongo.Collection) []MessWithId {
+	var result []MessWithId
+	opts := options.Find().SetSort(bson.D{{"time", -1}}).SetLimit(PER_REQ)
+	cursor, err := mess_c.Find(context.TODO(), bson.D{{"company_id", companyId}}, opts)
+	FailOnError(err, "Failed while getting messages from MongoDB")
+
+	err = cursor.All(context.TODO(), &result)
+	FailOnError(err, "Failed")
+
+
+	return result
+}
+
+func getUnreadCount(companyId string, unr_c *mongo.Collection) int {
+	var unread []UnreadMessage
+	opts := options.Find().SetSort(bson.D{{"count", -1}})
+	cursor, err := unr_c.Find(context.TODO(), bson.D{{"to_company", companyId}}, opts)
+	FailOnError(err, "Failed")
+
+	err = cursor.All(context.TODO(), &unread)
+	if len(unread) == 0 {
+		return 0
+	}
+
+	return unread[0].Count
+}
 
 func holdNotifications(redis_cl *redis.Client, ch_name string, mess_type string) {
 	pubsub := redis_cl.Subscribe(ch_name)
@@ -202,7 +245,6 @@ func holdNotifications(redis_cl *redis.Client, ch_name string, mess_type string)
 			CompanyName: r_m.CompanyName,
 			FromUser:    r_m.UserName,
 		}
-		fmt.Println(n)
 		notifications <- &NotifInnerStruct{note:&n, ForCompany: r_m.CompanyId, Users: company.Users}
 	}
 }
@@ -303,6 +345,14 @@ func routeEvents() {
 func WsChat(ws *websocket.Conn) {
 	defer ws.Close()
 
+	last_mess_id := "1"
+
+	// коллекции из базы
+	mess_c := db.Collection("messages")
+	comp_c := db.Collection("company")
+	unr_c  := db.Collection("unread_message")
+	note_c := db.Collection("notifications")
+
 	// Данные подключившегося пользователя
 	var clientData ClientData
 	// Сокеты идентифицируем по uuid
@@ -318,11 +368,27 @@ func WsChat(ws *websocket.Conn) {
 	clientRequests <- &NewClientEvent{clientData, Ch{msgChan, noteChan}}
 	defer func() { clientDisconnects <- &clientData }()
 
+	old_messages := getMessPart(clientData.CompanyId, last_mess_id, mess_c)
+	if len(old_messages) > 0 {
+		last_mess_id = old_messages[len(old_messages)-1].MessageId.String()
+	}
+
+    unread := getUnreadCount(clientData.CompanyId, unr_c)
+
+	init_data := map[string]interface{}{
+		"type": PART,
+		"messages": old_messages,
+		"unr_count": unread,
+	}
+	// отправка уже существующих сообщений в чат, инициализация чата
+	init_bytes, err := json.Marshal(init_data)
+	FailOnError(err, "Cant serialize old messages")
+	ws.Write(init_bytes)
+
 	// Отправка сообщений в сокет
 	go func() {
 		for m := range msgChan {
 			bytes, err := json.Marshal(m)
-			fmt.Println(m)
 			FailOnError(err, "Cant serialize message.")
 			ws.Write(bytes)
 		}
@@ -331,20 +397,11 @@ func WsChat(ws *websocket.Conn) {
 	// отправка оповещений в сокет
 	go func() {
 		for msg := range noteChan {
-			fmt.Println("asdas")
-			fmt.Println(msg)
-			fmt.Println("asdas")
 			bytes, err := json.Marshal(msg)
 			FailOnError(err, "Cant serialize message.")
 			ws.Write(bytes)
 		}
 	}()
-
-	// коллекции из базы
-	mess_c := db.Collection("messages")
-	comp_c := db.Collection("company")
-	unr_c  := db.Collection("unread_message")
-	note_c := db.Collection("notifications")
 
 	// получение сообщений из сокета
 	L:
@@ -361,6 +418,7 @@ func WsChat(ws *websocket.Conn) {
 					Msg:        messData.MText,
 					CompanyId:  companyId,
 					InsertTime: time.Now(),
+					UserName:   clientData.SelfLogin,
 				}
 
 				// Запись сообщения в базу
@@ -379,8 +437,18 @@ func WsChat(ws *websocket.Conn) {
 					).Decode(&company)
 				FailOnError(err, "Searching company in mongo failed")
 
+				fmt.Println(messData.CompanyName)
+				n_text := []string{
+					"Новое сообщение в чате ",
+					messData.CompanyName,
+					" от ",
+					clientData.SelfLogin,
+					" \"",
+					messData.MText,
+					"\"",
+				}
 				n := Notification{
-					Text:        messData.MText,
+					Text:        strings.Join(n_text, ""),
 					Type:        NOTIFICATION,
 					SubType:     NEW_MESS,
 					UserID:      messData.Sender,
@@ -407,13 +475,14 @@ func WsChat(ws *websocket.Conn) {
 							options.FindOne(),
 						).Decode(&u)
 
-						if err == nil {
+						if err != nil {
 							unread_m := UnreadMessage{
 								MsgID:     res.InsertedID.(primitive.ObjectID).Hex(),
 								ToCompany: companyId,
 								ToUser:    user,
 								Count:     1,
 							}
+							fmt.Println(unread_m)
 							_, err := unr_c.InsertOne(context.TODO(), unread_m)
 							FailOnError(err, "Creation unread message failed")
 
@@ -439,7 +508,7 @@ func WsChat(ws *websocket.Conn) {
 			        InsertTime:    time.Now(),
 			        CompanyId:     companyId,
 			    	FromUserLogin: clientData.SelfLogin,
-			    	Type:          NOTIFICATION,     
+			    	Type:          CHAT_MESS,     
 				}
 				messages      <- &msg
 				notifications <- &NotifInnerStruct{
