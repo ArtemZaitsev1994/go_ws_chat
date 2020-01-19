@@ -218,17 +218,6 @@ func getInitData(companyId, userId string, unr_c, mess_c *mongo.Collection) (map
 
     unread := getUnreadCount(companyId, unr_c)
 
-    _, err := unr_c.UpdateOne(
-    	context.TODO(),
-    	bson.D{
-			{"to_company", companyId},
-			{"to_user", userId},
-		},
-		bson.M{"$set": bson.M{"count": 0}},
-		options.Update(),
-	)
-	FailOnError(err, "Drop unread message failed")
-
 	init_data := map[string]interface{}{
 		"type": PART,
 		"messages": old_messages,
@@ -258,7 +247,6 @@ func sendJoinMess(cl ClientData, comp_c *mongo.Collection) {
 		// CompanyName: messData.CompanyName,
 		// FromUser:    messData.SenderLogin,
 	}
-	fmt.Println(n)
 	notifications <- &NotifInnerStruct{
 		note:       &n,
 		ForCompany: cl.CompanyId,
@@ -278,7 +266,6 @@ func holdNotifications(redis_cl *redis.Client, ch_name string, mess_type string)
 	redis_ch := pubsub.Channel()
 	for msg := range redis_ch {
 		var r_m RedisMess
-		fmt.Println(msg)
 		comp_c := db.Collection("company")
 		// избавляемся от слешей
 		s, _ := strconv.Unquote(string([]byte(msg.Payload)))
@@ -318,6 +305,7 @@ func routeEvents() {
 	sockets := make(map[string]map[uuid.UUID]Ch)
 
 	note_c := db.Collection("notifications")
+	unr_c := db.Collection("unread_message")
 
 	for {
 		select {
@@ -398,6 +386,17 @@ func routeEvents() {
 					}
 				}
 			case READ_UNREAD:
+				 _, err := unr_c.UpdateOne(
+			    	context.TODO(),
+			    	bson.D{
+						{"to_company", note.note.Company},
+						{"to_user", note.ForCompany},
+					},
+					bson.M{"$set": bson.M{"count": 0}},
+					options.Update(),
+				)
+				FailOnError(err, "Drop unread message failed")
+
 				for _, user := range note.Users {
 					for _, ch := range sockets[user] {
 						ch.noteChan <- note.note
@@ -581,7 +580,30 @@ func WsChat(ws *websocket.Conn) {
 				fmt.Println("WS closed.")
 				break L
 			case READ_UNREAD:
-				fmt.Println("unread")
+				// Получаем ID компании к которой относится сообщение
+				// получаем каждый раз ибо вдруг кто новый залетел
+				var company BSCompany
+				objID, err := primitive.ObjectIDFromHex(clientData.CompanyId)
+				FailOnError(err, "Creation ObjectID failed")
+
+				err = comp_c.FindOne(
+						context.TODO(),
+						bson.D{{"_id", objID}},
+						options.FindOne(),
+					).Decode(&company)
+				FailOnError(err, "Searching company in mongo failed")
+				
+				n := Notification{
+					Type:        NOTIFICATION,
+					SubType:     READ_UNREAD,
+					UserID:      messData.Sender,
+				}
+				notifications <- &NotifInnerStruct{
+					note:       &n,
+					ForCompany: messData.Company,
+					wsUuid:     clientData.wsUuid,
+					Users:      company.Users,
+				}
 			default:
 				fmt.Println("Undefined message type.")
 				break L
