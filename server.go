@@ -171,6 +171,7 @@ const (
 	JOINED              = "joined"
 	CLOSED              = "closed"
 	PART                = "part"
+	READ_UNREAD         = "unread"
 
 	// Еще какие-то типы... не помню
 	NOTIFICATION         = "notification"
@@ -208,6 +209,65 @@ func getUnreadCount(companyId string, unr_c *mongo.Collection) int {
 	return unread[0].Count
 }
 
+func getInitData(companyId, userId string, unr_c, mess_c *mongo.Collection) (map[string]interface{}, string) {
+	last_mess_id := "1"
+	old_messages := getMessPart(companyId, last_mess_id, mess_c)
+	if len(old_messages) > 0 {
+		last_mess_id = old_messages[len(old_messages)-1].MessageId.String()
+	}
+
+    unread := getUnreadCount(companyId, unr_c)
+
+    _, err := unr_c.UpdateOne(
+    	context.TODO(),
+    	bson.D{
+			{"to_company", companyId},
+			{"to_user", userId},
+		},
+		bson.M{"$set": bson.M{"count": 0}},
+		options.Update(),
+	)
+	FailOnError(err, "Drop unread message failed")
+
+	init_data := map[string]interface{}{
+		"type": PART,
+		"messages": old_messages,
+		"unr_count": unread,
+	}
+	return init_data, last_mess_id
+}
+
+func sendJoinMess(cl ClientData, comp_c *mongo.Collection) {
+	var company BSCompany
+	objID, err := primitive.ObjectIDFromHex(cl.CompanyId)
+	FailOnError(err, "Creation ObjectID failed")
+
+	err = comp_c.FindOne(
+			context.TODO(),
+			bson.D{{"_id", objID}},
+			options.FindOne(),
+		).Decode(&company)
+	FailOnError(err, "Searching company in mongo failed")
+
+	n := Notification{
+		// Text:        strings.Join(n_text, ""),
+		Type:        NOTIFICATION,
+		SubType:     READ_UNREAD,
+		UserID:      cl.SelfId,
+		// UserLogin:   messData.SenderLogin,
+		// CompanyName: messData.CompanyName,
+		// FromUser:    messData.SenderLogin,
+	}
+	fmt.Println(n)
+	notifications <- &NotifInnerStruct{
+		note:       &n,
+		ForCompany: cl.CompanyId,
+		wsUuid:     cl.wsUuid,
+		Users:      company.Users,
+	}
+
+}
+
 func holdNotifications(redis_cl *redis.Client, ch_name string, mess_type string) {
 	pubsub := redis_cl.Subscribe(ch_name)
 	// Wait for confirmation that subscription is created before publishing anything.
@@ -218,6 +278,7 @@ func holdNotifications(redis_cl *redis.Client, ch_name string, mess_type string)
 	redis_ch := pubsub.Channel()
 	for msg := range redis_ch {
 		var r_m RedisMess
+		fmt.Println(msg)
 		comp_c := db.Collection("company")
 		// избавляемся от слешей
 		s, _ := strconv.Unquote(string([]byte(msg.Payload)))
@@ -336,6 +397,12 @@ func routeEvents() {
 						ch.noteChan <- note.note
 					}
 				}
+			case READ_UNREAD:
+				for _, user := range note.Users {
+					for _, ch := range sockets[user] {
+						ch.noteChan <- note.note
+					}
+				}
 			}
 			// sockets[note.clientData.wsUuid].noteChan <- note
 		}
@@ -344,8 +411,6 @@ func routeEvents() {
 
 func WsChat(ws *websocket.Conn) {
 	defer ws.Close()
-
-	last_mess_id := "1"
 
 	// коллекции из базы
 	mess_c := db.Collection("messages")
@@ -368,22 +433,14 @@ func WsChat(ws *websocket.Conn) {
 	clientRequests <- &NewClientEvent{clientData, Ch{msgChan, noteChan}}
 	defer func() { clientDisconnects <- &clientData }()
 
-	old_messages := getMessPart(clientData.CompanyId, last_mess_id, mess_c)
-	if len(old_messages) > 0 {
-		last_mess_id = old_messages[len(old_messages)-1].MessageId.String()
-	}
-
-    unread := getUnreadCount(clientData.CompanyId, unr_c)
-
-	init_data := map[string]interface{}{
-		"type": PART,
-		"messages": old_messages,
-		"unr_count": unread,
-	}
+	init_data, _ := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
 	// отправка уже существующих сообщений в чат, инициализация чата
 	init_bytes, err := json.Marshal(init_data)
 	FailOnError(err, "Cant serialize old messages")
 	ws.Write(init_bytes)
+
+	// Оповещаем другие чаты что i'm in
+	sendJoinMess(clientData, comp_c)
 
 	// Отправка сообщений в сокет
 	go func() {
@@ -426,6 +483,7 @@ func WsChat(ws *websocket.Conn) {
 				FailOnError(err, "Insertion message failed")
 
 				// Получаем ID компании к которой относится сообщение
+				// получаем каждый раз ибо вдруг кто новый залетел
 				var company BSCompany
 				objID, err := primitive.ObjectIDFromHex(companyId)
 				FailOnError(err, "Creation ObjectID failed")
@@ -522,6 +580,8 @@ func WsChat(ws *websocket.Conn) {
 			case CLOSED:
 				fmt.Println("WS closed.")
 				break L
+			case READ_UNREAD:
+				fmt.Println("unread")
 			default:
 				fmt.Println("Undefined message type.")
 				break L
