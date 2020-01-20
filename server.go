@@ -389,8 +389,8 @@ func routeEvents() {
 				 _, err := unr_c.UpdateOne(
 			    	context.TODO(),
 			    	bson.D{
-						{"to_company", note.note.Company},
-						{"to_user", note.ForCompany},
+						{"to_company", note.ForCompany},
+						{"to_user", note.note.UserID},
 					},
 					bson.M{"$set": bson.M{"count": 0}},
 					options.Update(),
@@ -434,6 +434,7 @@ func WsChat(ws *websocket.Conn) {
 
 	init_data, _ := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
 	// отправка уже существующих сообщений в чат, инициализация чата
+
 	init_bytes, err := json.Marshal(init_data)
 	FailOnError(err, "Cant serialize old messages")
 	ws.Write(init_bytes)
@@ -494,7 +495,6 @@ func WsChat(ws *websocket.Conn) {
 					).Decode(&company)
 				FailOnError(err, "Searching company in mongo failed")
 
-				fmt.Println(messData.CompanyName)
 				n_text := []string{
 					"Новое сообщение в чате ",
 					messData.CompanyName,
@@ -539,7 +539,6 @@ func WsChat(ws *websocket.Conn) {
 								ToUser:    user,
 								Count:     1,
 							}
-							fmt.Println(unread_m)
 							_, err := unr_c.InsertOne(context.TODO(), unread_m)
 							FailOnError(err, "Creation unread message failed")
 
