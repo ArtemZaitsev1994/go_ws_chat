@@ -139,6 +139,15 @@ type (
 		UserName    string `json:"self_login"`
 		Payload     string `json:"payload"`
 	}
+
+	// Управляющие сообщения
+	ControlMess struct {
+	    Note        *Notification
+	    Mess        *JSMess
+	    Client      *ClientData
+	    Additioinal map[string]interface{}
+	    Type        string
+	}
 )
 
 
@@ -154,6 +163,9 @@ var (
 
 	// канал оповещений
 	notifications     = make(chan *NotifInnerStruct, 100)
+
+	// канал управляющих сообщений
+	control_mess      = make(chan *ControlMess, 100)
 
 	db       *mongo.Database
 	redis_cl *redis.Client
@@ -306,6 +318,7 @@ func routeEvents() {
 
 	note_c := db.Collection("notifications")
 	unr_c := db.Collection("unread_message")
+	mess_c := db.Collection("messages")
 
 	for {
 		select {
@@ -342,9 +355,31 @@ func routeEvents() {
 
 		// Обработка пришедших сообщений из чата
 		case msg := <-messages:
-			for _, ch := range rooms[msg.CompanyId] {
-				ch.msgChan <- msg
-			}
+
+		    switch t := msg.Type; t {
+		    case CHAT_MESS:
+                for _, ch := range rooms[msg.CompanyId] {
+                    ch.msgChan <- msg
+                }
+		    }
+
+		case control_m := control_mess:
+
+		    switch t := control_m.Type; t {
+
+		    case PART:
+		        var result []MessWithId
+                err := mess_c.Find(bson.M{"company_id", msg.CompanyId}
+                    ).Skip(control_m.Additioinal["req_num"] * PER_REQ).All(&result)
+
+                for i, mess := range result {
+                    if mess['_id'].Timestamp < primitive.ObjectIDFromHex(
+                            control_m.Additioinal["last_mess_id"]) {
+                        result = result[i: i + PER_REQ]
+                    }
+                }
+
+		    }
 
 		case note := <-notifications:
 
@@ -410,6 +445,7 @@ func routeEvents() {
 
 func WsChat(ws *websocket.Conn) {
 	defer ws.Close()
+	req_num := 1
 
 	// коллекции из базы
 	mess_c := db.Collection("messages")
@@ -419,7 +455,7 @@ func WsChat(ws *websocket.Conn) {
 
 	// Данные подключившегося пользователя
 	var clientData ClientData
-	// Сокеты идентифицируем по uuid
+	// Сокеты идентифицируем по uuid TODO peredelat'
 	clientData.wsUuid = uuid.New()
 	// Первое сообщение из сокета - данные о пользователе
 	websocket.JSON.Receive(ws, &clientData)
@@ -432,7 +468,7 @@ func WsChat(ws *websocket.Conn) {
 	clientRequests <- &NewClientEvent{clientData, Ch{msgChan, noteChan}}
 	defer func() { clientDisconnects <- &clientData }()
 
-	init_data, _ := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
+	init_data, last_mess_id := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
 	// отправка уже существующих сообщений в чат, инициализация чата
 
 	init_bytes, err := json.Marshal(init_data)
@@ -603,6 +639,19 @@ func WsChat(ws *websocket.Conn) {
 					wsUuid:     clientData.wsUuid,
 					Users:      company.Users,
 				}
+			case PART:
+			    fmt.Println("GET PART")
+			    msg := MessToCompany{
+					Client:     clientData.SelfId,
+			        Mess:       companyId,
+			    	Type:       PART,
+			    	Additional: map[string]interface{} {
+			    	    "last_mess_id": last_mess_id,
+			    	    "req_num": req_num,
+			    	}
+				}
+				ControlMess <-&msg
+			    req_num += 1
 			default:
 				fmt.Println("Undefined message type.")
 				break L
