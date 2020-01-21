@@ -42,8 +42,8 @@ type (
 
 	// Каналы
 	Ch struct {
-		msgChan   chan *MessToCompany
-		noteChan  chan *Notification
+		msgChan     chan *MessToCompany
+		noteChan    chan *Notification
 	}
 
 	// Структура для парсинга сообщения чата
@@ -145,8 +145,14 @@ type (
 	    Note        *Notification
 	    Mess        *JSMess
 	    Client      *ClientData
-	    Additioinal map[string]interface{}
+	    Additional  *AdditionalData
 	    Type        string
+	    WS          *websocket.Conn
+	}
+
+	AdditionalData struct {
+		RequestNumber int64
+		LastMessId    string
 	}
 )
 
@@ -194,7 +200,7 @@ const (
 )
 
 
-func getMessPart(companyId string, msgId string, mess_c *mongo.Collection) []MessWithId {
+func getMessPart(companyId, msgId string, mess_c *mongo.Collection) []MessWithId {
 	var result []MessWithId
 	opts := options.Find().SetSort(bson.D{{"time", -1}}).SetLimit(PER_REQ)
 	cursor, err := mess_c.Find(context.TODO(), bson.D{{"company_id", companyId}}, opts)
@@ -221,12 +227,13 @@ func getUnreadCount(companyId string, unr_c *mongo.Collection) int {
 	return unread[0].Count
 }
 
-func getInitData(companyId, userId string, unr_c, mess_c *mongo.Collection) (map[string]interface{}, string) {
+func getInitData(companyId, userId string, unr_c, mess_c *mongo.Collection) (map[string]interface{}, string, bool) {
 	last_mess_id := "1"
 	old_messages := getMessPart(companyId, last_mess_id, mess_c)
 	if len(old_messages) > 0 {
 		last_mess_id = old_messages[len(old_messages)-1].MessageId.String()
 	}
+	need_notify := old_messages[0].FromUser == userId
 
     unread := getUnreadCount(companyId, unr_c)
 
@@ -235,7 +242,7 @@ func getInitData(companyId, userId string, unr_c, mess_c *mongo.Collection) (map
 		"messages": old_messages,
 		"unr_count": unread,
 	}
-	return init_data, last_mess_id
+	return init_data, last_mess_id, need_notify
 }
 
 func sendJoinMess(cl ClientData, comp_c *mongo.Collection) {
@@ -363,22 +370,33 @@ func routeEvents() {
                 }
 		    }
 
-		case control_m := control_mess:
+		case control_m := <-control_mess:
 
 		    switch t := control_m.Type; t {
 
 		    case PART:
 		        var result []MessWithId
-                err := mess_c.Find(bson.M{"company_id", msg.CompanyId}
-                    ).Skip(control_m.Additioinal["req_num"] * PER_REQ).All(&result)
+		        opts := options.MergeFindOptions(
+		        	options.Find().SetSort(bson.D{{"_id", -1}}),
+		        	options.Find().SetSkip(control_m.Additional.RequestNumber * PER_REQ),
+		        )
+               	cursor, err := mess_c.Find(
+                	context.TODO(),
+                	bson.D{{"company_id", control_m.Client.CompanyId}},
+                	opts,
+                )
+                FailOnError(err, "Cant find part of messages")
+                cursor.All(context.TODO(), &result)
 
                 for i, mess := range result {
-                    if mess['_id'].Timestamp < primitive.ObjectIDFromHex(
-                            control_m.Additioinal["last_mess_id"]) {
+                    if mess.MessageId.String() == control_m.Additional.LastMessId {
                         result = result[i: i + PER_REQ]
                     }
                 }
-
+                fmt.Println(result)
+            	init_bytes, err := json.Marshal(map[string]interface{}{"messages": result, "type": PART})
+				FailOnError(err, "Cant serialize old messages")
+				control_m.WS.Write(init_bytes)
 		    }
 
 		case note := <-notifications:
@@ -445,7 +463,8 @@ func routeEvents() {
 
 func WsChat(ws *websocket.Conn) {
 	defer ws.Close()
-	req_num := 1
+	var req_num int64
+	req_num = 1
 
 	// коллекции из базы
 	mess_c := db.Collection("messages")
@@ -468,7 +487,7 @@ func WsChat(ws *websocket.Conn) {
 	clientRequests <- &NewClientEvent{clientData, Ch{msgChan, noteChan}}
 	defer func() { clientDisconnects <- &clientData }()
 
-	init_data, last_mess_id := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
+	init_data, last_mess_id, need_notify := getInitData(clientData.CompanyId, clientData.SelfId, unr_c, mess_c)
 	// отправка уже существующих сообщений в чат, инициализация чата
 
 	init_bytes, err := json.Marshal(init_data)
@@ -476,7 +495,9 @@ func WsChat(ws *websocket.Conn) {
 	ws.Write(init_bytes)
 
 	// Оповещаем другие чаты что i'm in
-	sendJoinMess(clientData, comp_c)
+	if !need_notify {
+		sendJoinMess(clientData, comp_c)
+	}
 
 	// Отправка сообщений в сокет
 	go func() {
@@ -641,16 +662,17 @@ func WsChat(ws *websocket.Conn) {
 				}
 			case PART:
 			    fmt.Println("GET PART")
-			    msg := MessToCompany{
-					Client:     clientData.SelfId,
-			        Mess:       companyId,
+			    control_m := ControlMess{
+					Client:     &clientData,
+			        Mess:       &messData,
 			    	Type:       PART,
-			    	Additional: map[string]interface{} {
-			    	    "last_mess_id": last_mess_id,
-			    	    "req_num": req_num,
-			    	}
+			    	Additional: &AdditionalData {
+			    	    RequestNumber: req_num,
+			    		LastMessId:    last_mess_id,
+			    	},
+			    	WS:         ws,
 				}
-				ControlMess <-&msg
+				control_mess <-&control_m
 			    req_num += 1
 			default:
 				fmt.Println("Undefined message type.")
